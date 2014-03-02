@@ -1,0 +1,21 @@
+<CAN>pxesplash.lss
+default menu.c32
+prompt 0
+timeout 300
+
+MENU TITLE XenServer PXE Installs
+
+LABEL XenServer 6.2 Manual Install
+kernel mboot.c32
+append xenserver62/xen.gz dom0_max_vcpus=1-2 dom0_mem=752M,max:752M com1=115200,8n1 console=com1,vga --- xenserver62/vmlinuz xencons=hvc console=hvc0 console=tty0 --- xenserver62/install.img
+
+LABEL XS62CN1 Xen 6.2 
+kernel mboot.c32
+append xenserver62/xen.gz dom0_max_vcpus=1-2 dom0_mem=752M,max:752M com1=115200,8n1 console=com1,vga --- xenserver62/vmlinuz xencons=hvc console=hvc0 console=tty0 answerfile=http://192.168.0.100/xs62cn1.xml -answerfile install --- xenserver62/install.img
+
+MENU SEPARATOR
+
+LABEL Back to Home Page
+MENU LABEL Back to Home Page
+KERNEL menu.c32
+APPEND pxelinux.cfg/default

@@ -1,0 +1,1046 @@
+#!/bin/bash
+#
+# Copyright 2014 Dag Sonstebo
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+#
+# Citrix Xenserver 6.2 build and configuration script 
+#
+# Set to start at runlevel 3 with priority 99.
+#
+# chkconfig: 3 99 99
+# description: Citrix Xenserver 6.2 build script
+#
+######################################################################################################
+# BUILD CONSTANTS
+#
+BUILDVERSION="Citrix Xenserver 6.2 v1.0";
+BUILDSERVER="http://192.168.0.100";
+BUILDSERVICE="xs62buildsvc";
+BUILDFOLDER="/root/build";
+BUILDLOG="${BUILDFOLDER}/build.log";
+BUILDSTATUSFILE="${BUILDFOLDER}/build.step";
+BUILDERROR="9999";
+BUILDCOMPLETION="8888";
+REBOOTDELAY="10";
+POOLJOINRETRIES="600";
+POOLJOINRETRYDELAY="30";
+RESOLVCONF="/etc/resolv.conf";
+NTPCONFTEMPL="${BUILDFOLDER}/xs62ntp.conf";
+BUILDCONFIGSCRIPT=${BUILDFOLDER}/`hostname | cut -d"." -f1`".cfg";
+DRIVERSFOLDER="${BUILDFOLDER}/drivers";
+PATCHFOLDER="${BUILDFOLDER}/patches";
+PATCHFILE="xs62patches.tgz";
+PATCHLOG="patchinstall.log";
+SPLASHSCREENFILE="xsbuildbackground.png";
+# FILELIST=( "path/to/file1.tgz" "path/to/file2.sh" );
+DELIMITER="-----------------------------------------------------------------------------------------";
+
+#####################################################################################################
+# FUNCTIONS 
+#
+# Interrogate DMI
+function CheckHardware()
+{	
+	local strSysManufacturer;
+	local strSysModel;
+	local strSysSerial;
+	
+	WriteOutput "INFO  ${DELIMITER}";
+	WriteOutput "INFO  Hardware info";	
+	strSysManufacturer=`dmidecode --string system-manufacturer`;
+	strSysModel=`dmidecode --string system-product-name`;
+	strSysSerial=`dmidecode --string system-serial-number`;
+	WriteOutput "INFO  System detected: " ${strSysManufacturer}" "${strSysModel};
+	WriteOutput "INFO  System serial: "${strSysSerial};
+}
+
+########################################################################################
+# Check Xenserver release
+function CheckRelease()
+{
+        local strRelease;
+
+		WriteOutput "INFO  ${DELIMITER}";
+		WriteOutput "INFO  Xenserver release";	
+        strRelease=`grep -i xenserver /etc/redhat-release`;
+        if [ $strRelease == "" ]; 
+        then
+                WriteOutput "ERROR Script should be run on Citrix Xenservers only. No changes made.";
+				UpdateBuildStatus ${BUILDERROR};
+                exit;
+        else
+                WriteOutput "INFO  Xenserver release detected:" $strRelease;
+        fi
+}
+
+########################################################################################
+# Write to log file + console
+function WriteOutput()
+{
+        local strLogtimestamp;
+        strLogtimestamp=`date +"%Y-%m-%d %H:%M:%S"`;
+		echo -e "[BUILD]" "$*" > /dev/tty0;
+        echo $strLogtimestamp "$*" >> $BUILDLOG;
+}
+
+########################################################################################
+# Update hardware drivers downloaded during post install.
+function UpdateDrivers(){
+
+	local strDriverFile;
+	local strSysManufacturer;
+	local strSysModel;
+
+	WriteOutput "INFO  ${DELIMITER}";
+	WriteOutput "INFO  Driver update";	
+
+	strSysManufacturer=`dmidecode --string system-manufacturer`;
+	strSysModel=`dmidecode --string system-product-name`;
+	
+	case "${strSysManufacturer}" in
+		#Following added as example only
+		"Dell Inc.")
+			case "${strSysModel}" in
+				
+				"PowerEdge M620")	
+				# Driver specific install here
+				;;
+
+				*)
+				WriteOutput "INFO  No drivers supplied for system model ${strSysManufacturer} ${strSysModel}.";
+				;;
+			esac
+		;;
+		
+		*)
+		WriteOutput "INFO  No drivers supplied for system manufacturer ${strSysManufacturer}.";
+		;;
+
+	esac
+}
+
+########################################################################################
+# Install patches on all Xenserver hosts.
+# Install all patches from file to prevent problems when joining pool.
+function InstallXSPatches()
+{	
+	local strXSpatchfile;
+	local strPatchuuid;
+	local strLocalhostuuid;
+
+	WriteOutput "INFO  ${DELIMITER}";
+	WriteOutput "INFO  Patch install";	
+
+	strLocalhostuuid=`xe host-list name-label=\`hostname\` params=uuid --minimal`;
+	WriteOutput "INFO  Applying Xenserver patches to localhost."	
+
+	cd ${PATCHFOLDER};
+	tar zxvf ${PATCHFILE};
+	for strXSpatchfile in *.xsupdate;
+	do	
+		WriteOutput "INFO  Installing ${strXSpatchfile}.";
+		strPatchuuid=`xe patch-upload file-name=${strXSpatchfile}`;
+		WriteOutput "INFO  Patch UUID: "${strPatchuuid};
+		echo ${DELIMITER} >> ${PATCHLOG};
+		echo ${strXSpatchfile} >> ${PATCHLOG};
+		echo ${strPatchuuid} >> ${PATCHLOG};
+		xe patch-apply host-uuid=${strLocalhostuuid} uuid=${strPatchuuid} >> ${PATCHLOG} 2>&1;
+	done
+}
+
+########################################################################################
+# Check build progress status
+# 
+function CheckBuildStatus()
+{	
+	local strKeyPressed;
+	if [ -f ${BUILDSTATUSFILE} ];
+	then	
+		intCurrentBuildStep=`cat $BUILDSTATUSFILE | grep CURRENTSTEP | cut -d":" -f2`;
+		
+		# If build status at fatal error then quit
+		if [ "$intCurrentBuildStep" == "${BUILDERROR}" ]; 
+		then		
+			# Fatal errror detected in previous step, exit.
+			WriteOutput "ERROR Build fatal error" $intCurrentBuildStep", exiting."
+			exit;
+		fi
+	else
+		# If status file not found then exit.
+		WriteOutput "ERROR No build status file found, exiting.";
+		exit;
+	fi
+
+	# Check for anyone trying to break out of build process
+	read -s -n 1 -t 1 strKeyPressed;
+	if [ "${strKeyPressed}" == "q" ];
+	then
+		WriteOutput "WARN  Build interrupted by \"q\" keypress, exiting.";
+		UpdateBuildStatus ${BUILDERROR};
+		exit;
+	fi
+}
+
+########################################################################################
+function UpdateBuildStatus()
+{	
+	local strXeLocalhostUuid;
+	local strXeLocalhostNewdescription;
+	local strNewDescription;
+	local strDescReturn;
+	
+    if [ -f ${BUILDSTATUSFILE} ];
+    then
+    	echo -e "CURRENTSTEP:"$1 > $BUILDSTATUSFILE;
+		WriteOutput "INFO  Build status updated to" $1;
+	else
+		WriteOutput "ERROR No build status file found, exiting.";
+        exit;
+	fi
+
+	# Update host description field with build information.	
+	strXeLocalhostUuid="";
+	while [ -z ${strXeLocalhostUuid} ];
+	do
+		sleep 5;
+		strXeLocalhostUuid=`xe host-list name-label=\`hostname\` params=uuid --minimal`;
+	done
+	
+	# Parse new description
+	if [ $1 -eq ${BUILDCOMPLETION} ];
+	then 	
+		strNewDescription=${BUILDVERSION}" (BUILD COMPLETE)";
+	else	
+		strNewDescription=${BUILDVERSION}" (BUILD INCOMPLETE STEP "$1")";
+	fi	
+
+	# Set new host description, wait 5 sec in case toolstack not yet up	
+	strDescReturn="null";
+	until [ -z ${strDescReturn} ];
+	do
+		sleep 5;
+		strDescReturn=`xe host-param-set name-description="${strNewDescription}" uuid=${strXeLocalhostUuid} 2>&1`;
+	done
+
+	# As above - wait for toolstack to come up
+	strXeLocalhostNewdescription="null";
+	until [ "${strXeLocalhostNewdescription}" = "${strNewDescription}" ];
+	do
+		sleep 5;
+		strXeLocalhostNewdescription=`xe host-list uuid=${strXeLocalhostUuid} params=name-description --minimal 2>&1`;
+	done
+	WriteOutput "INFO  Local host description set to: "${strXeLocalhostNewdescription};
+}
+
+########################################################################################
+function DownloadAllFiles()
+{	
+	local strFile;
+	local intRetVal;
+
+	WriteOutput "INFO  ${DELIMITER}";
+	WriteOutput "INFO  File download";	
+
+	cd ${BUILDFOLDER};
+	for strFile in "${FILELIST[@]}";
+	do
+		wget ${BUILDSERVER}/${strFile};
+		intRetVal=$?;
+		if [ ${intRetVal} -eq 0 ];
+		then
+			WriteOutput "INFO  ${BUILDSERVER}/${strFile} successfully downloaded.";
+		else
+			WriteOutput "ERROR Could not download ${BUILDSERVER}/${strFile} (error ${intRetVal}).";
+		fi
+	done
+}
+
+########################################################################################
+function RebootServer()
+{
+	# Waits $REBOOTDELAY before reboot.
+	sleep ${REBOOTDELAY};
+	WriteOutput "WARN  Rebooting server."
+	reboot;
+}
+
+########################################################################################
+function ChangeRootPwd()
+{	
+	local intRetVal;
+	
+	WriteOutput "INFO  ${DELIMITER}";	
+	WriteOutput "INFO  Changing root password.";
+	source ${BUILDCONFIGSCRIPT};
+	echo ${CFG_PASSWORD} | passwd root --stdin;
+	intRetVal=$?;
+	if [ ${intRetVal} -eq 0 ];
+	then	
+		WriteOutput "INFO  Root password successfully changed.";
+	else
+		WriteOutput "ERROR Could not change root password.";
+	fi
+}
+
+########################################################################################
+function ConfigureBasicNetworking()
+{	
+	local strXeLocalhostUuid;
+
+	WriteOutput "INFO  ${DELIMITER}";
+	WriteOutput "INFO  Basic networking";	
+
+	# Load configuration details.	
+	source ${BUILDCONFIGSCRIPT};
+	hostname ${CFG_HOSTNAME};
+	
+	# Update Xenserver settings.
+	# First retrieve host UUID, then set local host as well as the Xencentre hostname / label
+	strXeLocalhostUuid=`xe host-list params=uuid --minimal`;
+	WriteOutput "INFO  Localhost UUID: "${strXeLocalhostUuid};
+	xe host-set-hostname-live host-uuid=${strXeLocalhostUuid} host-name=${CFG_HOSTNAME};	
+	xe host-param-set name-label=${CFG_HOSTNAME} uuid=${strXeLocalhostUuid};	
+	WriteOutput "INFO  Hostname changed to "${CFG_HOSTNAME};
+	
+	# Write searchdomain and nameservers to resolv.conf.
+	echo -e "search "${CFG_SEARCHDOMAIN}"\nnameserver "${CFG_DNS1}"\nnameserver "${CFG_DNS2} > ${RESOLVCONF};
+	WriteOutput "INFO  "${RESOLVCONF}" updated with new DNS settings.";
+}
+
+########################################################################################
+function ConfigureNTP()
+{
+	# Back up old ntp.conf file, copy in the new template and write own NTP server at the end
+	
+	local strTimestamp;
+	local strBackupfilename;
+	
+	WriteOutput "INFO  ${DELIMITER}";
+	WriteOutput "INFO  NTP";	
+
+	strTimestamp=`date +"%Y%m%d%H%M%S"`;
+	strBackupfilename="ntp_"${strTimestamp}".conf";
+	WriteOutput "INFO  Backing up old ntp.conf file to "${strBackupfilename};
+	mv /etc/ntp.conf /etc/${strBackupfilename};
+	WriteOutput "INFO  Configuring new ntp.conf with time server "${CFG_NTP1};
+
+	# Write new ntp.conf
+	cat > /etc/ntp.conf << 'EOL'	
+restrict default kod nomodify notrap nopeer noquery
+restrict -6 default kod nomodify notrap nopeer noquery
+restrict 127.0.0.1 
+restrict -6 ::1
+server	127.127.1.0	# local clock
+fudge	127.127.1.0 stratum 10	
+driftfile /var/lib/ntp/drift
+keys /etc/ntp/keys
+EOL
+
+	# Append server line
+	echo "server "${CFG_NTP1} >> /etc/ntp.conf
+
+	# Set hardware synch back in NTP
+	sed -i 's/SYNC_HWCLOCK=no/SYNC_HWCLOCK=yes/g' /etc/sysconfig/ntpd
+
+	# Restart NTP
+	service ntpd restart;
+	WriteOutput "INFO  New NTP settings configured, ntpd restarted.";
+}
+
+########################################################################################
+# Install licenses
+# 
+function InstallLicense()
+{
+	WriteOutput "INFO  ${DELIMITER}";
+	WriteOutput "INFO  Licensing";	
+	if [ "${CFG_EDITION}" == "free" ]; then
+		WriteOutput "INFO  Configuring free license.";
+		xe host-apply-edition edition=free;
+	else
+		WriteOutput "INFO  Configuring host with ${CFG_EDITION} license.";
+		WriteOutput "INFO  License server / port: ${CFG_LICENSESRV}:${CFG_LICENSEPORT}.";
+		xe host-apply-edition edition=${CFG_EDITION} license-server-address=${CFG_LICENSESRV} license-server-port=${CFG_LICENSEPORT};
+	fi
+}
+
+########################################################################################
+# Report kernel release and version
+# 
+function ReportKernel()
+{
+	WriteOutput "INFO  ${DELIMITER}";
+	WriteOutput "INFO  Kernel release";	
+	WriteOutput "INFO  Current kernel release: "`uname -r`;
+	WriteOutput "INFO  Current kernel version: "`uname -v`;
+}
+
+#####################################################################################
+# Configure poolmaster networks and bonds
+#
+function ConfigurePoolmasterNetworks()
+{
+		WriteOutput "INFO  ${DELIMITER}";
+		WriteOutput "INFO  Poolmaster networking";	
+
+        WriteOutput "INFO  Configuring networks and bonds on poolmaster.";
+
+        # Load all host specific configuration details.
+        source ${BUILDCONFIGSCRIPT};
+
+        # Local scope variables
+        local strXe_NICA_uuid;
+        local strXe_NICB_uuid;
+        local strXe_Network_uuid;
+        local strXe_Bond_uuid;
+        local strXe_Bondmaster_uuid;
+        local strXe_Devicename_detected;	    
+		local strXe_VLAN_uuid;
+		local strXe_VLAN_detected;
+		local strXe_Localhost_uuid;
+		local strXe_Poolname_detected;
+		local strXe_Pool_uuid;
+     
+      	# Parsing variables
+		local intNetwork;
+		local strParsedNetname;
+		local strParsedDesc;
+		local strParsedNICA;
+		local strParsedNICB;
+		local strParsedBondmode;
+		local strParsedMTU;
+		local strParsedType;
+		local strParsedVLAN;
+		local strParsedIF;
+		local strParsedIFIP;
+		local strParsedIFNetmask;
+		local strParsedIFGW;
+		local strParsedIFName;
+		local strXe_IF_uuid;
+
+		# Iterate through all networks and bonds specified		
+		intNetwork=0;
+		while :
+		do 
+			# Next network		
+			((intNetwork++));
+						
+			# Reset all variables
+			strXe_NICA_uuid="null";
+        	strXe_NICB_uuid="null";
+        	strXe_Network_uuid="null";
+			strXe_Bond_uuid="null";
+			strXe_Bond_master_uuid="null";
+			strXe_Devicename_detected="null";
+			strXe_VLAN_uuid="null";
+			strXe_VLAN_detected="null";
+			strXe_IF_uuid="null";
+
+			# Parse pointer names
+			# Using dynamic variables rather that associative arrays
+			# to make host specific config file format cleaner.
+			strParsedNetname="CFG_NW${intNetwork}_NAME";
+			strParsedDesc="CFG_NW${intNetwork}_DESC";
+			strParsedType="CFG_NW${intNetwork}_TYPE";
+			strParsedNICA="CFG_NW${intNetwork}_NICA";
+			strParsedNICB="CFG_NW${intNetwork}_NICB";
+			strParsedBondmode="CFG_NW${intNetwork}_BONDMODE";
+			strParsedMTU="CFG_NW${intNetwork}_MTU";
+			strParsedVLAN="CFG_NW${intNetwork}_VLAN";
+			strParsedIF="CFG_NW${intNetwork}_IF";
+			strParsedIFIP="CFG_NW${intNetwork}_IFIP";
+			strParsedIFNetmask="CFG_NW${intNetwork}_IFNETMASK";
+			strParsedIFGW="CFG_NW${intNetwork}_IFGW";
+			strParsedIFName="CFG_NW${intNetwork}_IFNAME";
+
+			# Quit if reached last network
+			if [ -z ${!strParsedNetname} ];
+			then
+				WriteOutput "INFO  No further networks specified.";
+				break;
+			fi
+			WriteOutput "INFO  === Network ${intNetwork} ===============";
+
+	        # Find the UUIDs of the bond NICs / PIFs
+    	    strXe_NICA_uuid=`xe pif-list device=${!strParsedNICA} params=uuid --minimal`;
+        	strXe_NICB_uuid=`xe pif-list device=${!strParsedNICB} params=uuid --minimal`;
+        	WriteOutput "INFO  NIC ${!strParsedNICA} UUID: "${strXe_NICA_uuid};
+        	WriteOutput "INFO  NIC ${!strParsedNICB} UUID: "${strXe_NICB_uuid};
+
+			# Create network and catch uuid
+			# MTU is optional but xe does not accept empty MTU setting
+			if [ -z ${!strParsedMTU} ];
+			then
+				WriteOutput "INFO  Creating network ${!strParsedNetname}, no MTU specified.";
+				strXe_Network_uuid=`xe network-create name-label=${!strParsedNetname} name-description="${!strParsedDesc}"`;
+			else
+				WriteOutput "INFO  Creating network ${!strParsedNetname}, MTU ${!strParsedMTU}.";
+				strXe_Network_uuid=`xe network-create name-label=${!strParsedNetname} name-description="${!strParsedDesc}" MTU=${!strParsedMTU}`;
+			fi
+
+			# Disable auto connect
+			xe network-param-set other-config:automatic=false uuid=${strXe_Network_uuid};	
+
+			WriteOutput "INFO  Network ${!strParsedNetname} UUID: "${strXe_Network_uuid};
+			WriteOutput "INFO  Network ${!strParsedNetname} type: "${!strParsedType}; 
+
+			# Process bonds, vlans (bonds a prerequisite) and interfaces.
+			case "${!strParsedType}" in
+			"BOND" | "bond" )
+				# Report bond mode
+				WriteOutput "INFO  === Bond ${intNetwork} ===============";
+				WriteOutput "INFO  Bond mode for network ${!strParsedNetname}: ${!strParsedBondmode}."
+			
+				# Create bond
+				strXe_Bond_uuid=`xe bond-create network-uuid=${strXe_Network_uuid} pif-uuids=${strXe_NICA_uuid},${strXe_NICB_uuid} mode=${!strParsedBondmode}`;
+				WriteOutput "INFO  Network ${!strParsedNetname} bond UUID: "${strXe_Bond_uuid};
+
+				# Get the bond master uuid	
+				strXe_Bond_master_uuid=`xe bond-list uuid=${strXe_Bond_uuid} params=master --minimal`;
+				strXe_IF_uuid=${strXe_Bond_master_uuid};
+				WriteOutput "INFO  Bond master UUID: "${strXe_Bond_master_uuid};
+
+				# Double check the bond:
+				strXe_Devicename_detected=`xe pif-list uuid=${strXe_Bond_master_uuid} params=device --minimal`;
+				WriteOutput "INFO  ${!strParsedNICA} + ${!strParsedNICB} bond cross check, device detected as:" ${strXe_Devicename_detected};
+
+				# Fix searchdomain which isn't persistent after being set just in file
+				xe pif-param-set uuid=${strXe_Bond_master_uuid} other-config:domain=${CFG_SEARCHDOMAIN};
+				WriteOutput "INFO  Searchdomain set to ${CFG_SEARCHDOMAIN}";
+
+				# Plug in new PIF to bring online
+        		xe pif-plug uuid=${strXe_Bond_master_uuid};
+			;;
+				
+			"VLAN" | "vlan")
+				WriteOutput "INFO  === VLAN ${intNetwork} ===============";
+				# Bond must already exist so searching for bond uuid using the specified NICs
+				strXe_Bond_master_uuid=`xe bond-list slaves=${strXe_NICA_uuid}"; "${strXe_NICB_uuid} params=master --minimal`;
+				if [ -z ${strXe_Bond_master_uuid} ];
+				then 
+					strXe_Bond_master_uuid=`xe bond-list slaves=${strXe_NICB_uuid}"; "${strXe_NICA_uuid} params=master --minimal`;
+				fi
+				WriteOutput "INFO  ${!strParsedNICA} + ${!strParsedNICB} bond master UUID: "${strXe_Bond_master_uuid};
+
+				# Create VLAN
+				strXe_VLAN_uuid=`xe vlan-create network-uuid=${strXe_Network_uuid} pif-uuid=${strXe_Bond_master_uuid} vlan=${!strParsedVLAN}`;
+				strXe_IF_uuid=${strXe_VLAN_uuid};
+				WriteOutput "INFO  VLAN ${!strParsedVLAN} untagged-PIF UUID: "${strXe_VLAN_uuid};
+				
+				# Doublecheck
+				strXe_VLAN_detected=`xe vlan-list untagged-PIF=${strXe_VLAN_uuid} params=tag --minimal`;
+				strXe_Devicename_detected=`xe network-list PIF-uuids=${strXe_VLAN_uuid} params=name-label --minimal`;
+				WriteOutput "INFO  Network ${strXe_Devicename_detected} created with VLAN ${strXe_VLAN_detected}.";
+
+				# Plug in new VLAN to bring online
+        		xe pif-plug uuid=${strXe_VLAN_uuid};
+			;;
+			esac #bonds / vlans
+
+			# Process interfaces			
+			WriteOutput "INFO  === Interface ${intNetwork} ===============";
+			case "${!strParsedIF}" in
+			"STATIC" | "static" )
+				WriteOutput "INFO  Configuring IP interface on ${strXe_Devicename_detected}, UUID ${strXe_IF_uuid}.";
+				xe pif-reconfigure-ip uuid=${strXe_IF_uuid} IP=${!strParsedIFIP} netmask=${!strParsedIFNetmask} gateway=${!strParsedIFGW} mode=static;
+				xe pif-param-set uuid=${strXe_IF_uuid} other-config:management_purpose=${!strParsedIFName};
+				xe pif-param-set disallow-unplug=true uuid=${strXe_IF_uuid};
+				WriteOutput "INFO  IP interface configured on ${strXe_Devicename_detected}: ${!strParsedIFIP}/${!strParsedIFNetmask}, GW ${!strParsedIFGW}.";
+			;;
+			
+			"DHCP" | "dhcp" )
+				WriteOutput "INFO  Configuring IP interface on ${strXe_Devicename_detected}, UUID ${strXe_IF_uuid}.";
+				xe pif-reconfigure-ip uuid=${strXe_IF_uuid} mode=dhcp;
+				xe pif-param-set uuid=${strXe_IF_uuid} other-config:management_purpose=${!strParsedIFName};
+				xe pif-param-set disallow-unplug=true uuid=${strXe_IF_uuid};
+				WriteOutput "INFO  IP interface configured on ${strXe_Devicename_detected}: DHCP configured.";
+			;;
+			
+			"" | "*" )
+				WriteOutput "INFO  No IP interfaces specified."; 
+			;;
+			esac #interfaces
+
+		done #Network number
+		
+		# Set poolname
+		strXe_Localhost_uuid=`xe host-list hostname=\`hostname\` params=uuid --minimal`;
+		strXe_Pool_uuid=`xe pool-list master=${strXe_Localhost_uuid} params=uuid --minimal`;
+		strXe_Poolname_detected=`xe pool-list master=${strXe_Localhost_uuid} params=name-label --minimal`;
+		WriteOutput "INFO  Changing poolname to ${CFG_POOLNAME}.";
+		xe pool-param-set uuid=${strXe_Pool_uuid} name-label=${CFG_POOLNAME};		
+}
+
+
+#####################################################################################
+# Configure slave networks and bonds
+#
+function ConfigureSlaveNetworks()
+{
+		WriteOutput "INFO  ${DELIMITER}";
+		WriteOutput "INFO  Slave networking";	
+
+        WriteOutput "INFO  Configuring networks and bonds on slave.";
+
+        # Load all host specific configuration details.
+        source ${BUILDCONFIGSCRIPT};
+
+        # Local scope variables
+        local strXe_NICA_uuid;
+        local strXe_NICB_uuid;
+        local strXe_Network_uuid;
+        local strXe_Bond_uuid;
+        local strXe_Bondmaster_uuid;
+        local strXe_Devicename_detected;	    
+		local strXe_VLAN_uuid;
+		local strXe_VLAN_detected;
+		local strXe_Localhost_uuid;
+     
+      	# Parsing variables
+		local intNetwork;
+		local strParsedNetname;
+		local strParsedDesc;
+		local strParsedNICA;
+		local strParsedNICB;
+		local strParsedBondmode;
+		local strParsedMTU;
+		local strParsedType;
+		local strParsedVLAN;
+		local strParsedIF;
+		local strParsedIFIP;
+		local strParsedIFNetmask;
+		local strParsedIFGW;
+		local strParsedIFName;
+		local strXe_IF_uuid;
+
+		# Iterate through all networks and bonds specified		
+		intNetwork=0;
+		while :
+		do 
+			# Next network		
+			((intNetwork++));
+						
+			# Reset all variables
+			strXe_NICA_uuid="null";
+        	strXe_NICB_uuid="null";
+        	strXe_Network_uuid="null";
+			strXe_Bond_uuid="null";
+			strXe_Bond_master_uuid="null";
+			strXe_Devicename_detected="null";
+			strXe_VLAN_uuid="null";
+			strXe_VLAN_detected="null";
+			strXe_IF_uuid="null";
+			strXe_Localhost_uuid="null";
+
+			# Parse pointer names
+			# Using dynamic variables rather that associative arrays
+			# to make host specific config file format cleaner.
+			strParsedNetname="CFG_NW${intNetwork}_NAME";
+			strParsedDesc="CFG_NW${intNetwork}_DESC";
+			strParsedType="CFG_NW${intNetwork}_TYPE";
+			strParsedNICA="CFG_NW${intNetwork}_NICA";
+			strParsedNICB="CFG_NW${intNetwork}_NICB";
+			strParsedBondmode="CFG_NW${intNetwork}_BONDMODE";
+			strParsedMTU="CFG_NW${intNetwork}_MTU";
+			strParsedVLAN="CFG_NW${intNetwork}_VLAN";
+			strParsedIF="CFG_NW${intNetwork}_IF";
+			strParsedIFIP="CFG_NW${intNetwork}_IFIP";
+			strParsedIFNetmask="CFG_NW${intNetwork}_IFNETMASK";
+			strParsedIFGW="CFG_NW${intNetwork}_IFGW";
+			strParsedIFName="CFG_NW${intNetwork}_IFNAME";
+
+			# Quit if reached last network
+			if [ -z ${!strParsedNetname} ];
+			then
+				WriteOutput "INFO  No further networks specified.";
+				break;
+			fi
+			WriteOutput "INFO  === Network ${intNetwork} ===============";
+
+			# Double check bonds
+			WriteOutput "INFO  === Bond ${intNetwork} ===============";
+
+	        # Find the UUIDs of the bond NICs / PIFs
+			strXe_Localhost_uuid=`xe host-list hostname=\`hostname\` params=uuid --minimal`;
+    	    strXe_NICA_uuid=`xe pif-list host-uuid=${strXe_Localhost_uuid} device=${!strParsedNICA} params=uuid --minimal`;
+        	strXe_NICB_uuid=`xe pif-list host-uuid=${strXe_Localhost_uuid} device=${!strParsedNICB} params=uuid --minimal`;
+        	WriteOutput "INFO  NIC ${!strParsedNICA} UUID: "${strXe_NICA_uuid};
+        	WriteOutput "INFO  NIC ${!strParsedNICB} UUID: "${strXe_NICB_uuid};
+
+			# Find bond masteruuid
+			# Required for both bonds and vlans
+			strXe_Bond_master_uuid=`xe bond-list slaves=${strXe_NICA_uuid}"; "${strXe_NICB_uuid} params=master --minimal`;
+			if [ -z ${strXe_Bond_master_uuid} ];
+			then
+				strXe_Bond_master_uuid=`xe bond-list slaves=${strXe_NICB_uuid}"; "${strXe_NICA_uuid} params=master --minimal`;
+			fi
+			strXe_IF_uuid=${strXe_Bond_master_uuid};
+			WriteOutput "INFO  ${!strParsedNICA} + ${!strParsedNICB} bond master UUID: "${strXe_Bond_master_uuid};
+			
+			# Find bond device name
+			strXe_Devicename_detected=`xe pif-list uuid=${strXe_Bond_master_uuid} params=device --minimal`;
+			WriteOutput "INFO  ${!strParsedNICA} + ${!strParsedNICB} bond cross check, device detected as:" ${strXe_Devicename_detected};
+
+			# Process bonds, vlans (bonds a prerequisite) and interfaces.
+			case "${!strParsedType}" in
+			"BOND" | "bond" )
+
+				# Doublecheck based on network name	
+				strXe_Bond_uuid=`xe pif-list host-name-label=\`hostname\` network-name-label=${!strParsedNetname} params=uuid --minimal`;
+				WriteOutput "INFO  ${!strParsedNetname} network detected as PIF with UUID ${strXe_Bond_uuid}";	
+
+				# Fix searchdomain which isn't persistent after being set just in file
+				xe pif-param-set uuid=${strXe_Bond_master_uuid} other-config:domain=${CFG_SEARCHDOMAIN};
+				WriteOutput "INFO  Searchdomain set to ${CFG_SEARCHDOMAIN}";
+
+				# Plug in new PIF to bring online
+        		xe pif-plug uuid=${strXe_Bond_master_uuid};
+			;;
+				
+			"VLAN" | "vlan")
+				WriteOutput "INFO  === VLAN ${intNetwork} ===============";
+
+				# Doublecheck VLAN
+				strXe_VLAN_uuid=`xe vlan-list tagged-PIF=${strXe_Bond_master_uuid} tag=${!strParsedVLAN} params=untagged-PIF --minimal`;
+				
+				# Catch untagged PIF to set IP later
+				# Updating this from just bond above
+				strXe_IF_uuid=${strXe_VLAN_uuid};
+
+				# Device name
+				strXe_Devicename_detected=`xe network-list PIF-uuids:contains=${strXe_VLAN_uuid} params=name-label --minimal`;
+				WriteOutput "INFO  VLAN ${!strParsedVLAN} attached to network ${strXe_Devicename_detected}.";
+
+				# Plug in new VLAN to bring online
+        		xe pif-plug uuid=${strXe_VLAN_uuid};
+			;;
+			esac #bonds / vlans
+
+			# Process interfaces			
+			WriteOutput "INFO  === Interface ${intNetwork} ===============";
+			case "${!strParsedIF}" in
+			"STATIC" | "static" )
+				WriteOutput "INFO  Configuring IP interface on ${strXe_Devicename_detected}, UUID ${strXe_IF_uuid}.";
+				xe pif-reconfigure-ip uuid=${strXe_IF_uuid} IP=${!strParsedIFIP} netmask=${!strParsedIFNetmask} gateway=${!strParsedIFGW} mode=static;
+				xe pif-param-set uuid=${strXe_IF_uuid} other-config:management_purpose=${!strParsedIFName};
+				xe pif-param-set disallow-unplug=true uuid=${strXe_IF_uuid};
+				WriteOutput "INFO  IP interface configured on ${strXe_Devicename_detected}: ${!strParsedIFIP}/${!strParsedIFNetmask}, GW ${!strParsedIFGW}.";
+			;;
+			
+			"DHCP" | "dhcp" )
+				WriteOutput "INFO  Configuring IP interface on ${strXe_Devicename_detected}, UUID ${strXe_IF_uuid}.";
+				xe pif-reconfigure-ip uuid=${strXe_IF_uuid} mode=dhcp;
+				xe pif-param-set uuid=${strXe_IF_uuid} other-config:management_purpose=${!strParsedIFName};
+				xe pif-param-set disallow-unplug=true uuid=${strXe_IF_uuid};
+				WriteOutput "INFO  IP interface configured on ${strXe_Devicename_detected}: DHCP configured.";
+			;;
+			
+			"" | "*" )
+				WriteOutput "INFO  No IP interfaces specified."; 
+			;;
+			esac #interfaces
+
+		done #Network number
+}
+
+
+
+#####################################################################################################
+# Configure management eth ip address
+# For slaves this is required to do the initial pool join, after this the join operation takes care of bonds etc.
+# For poolmasters this is in Xen6 required to create the bond, without private IP on one NIC the bond doesn't come online.
+#
+function ConfigureEthIP()
+{
+	source ${BUILDCONFIGSCRIPT};
+        
+	local strXe_NICA_uuid;
+
+	WriteOutput "INFO  ${DELIMITER}";
+	WriteOutput "INFO  Initial NIC IP config";	
+
+	WriteOutput "INFO  Configuring management NIC IP on ${CFG_INITIALNIC}.";
+
+	# Find the UUIDs of the initial NIC
+	strXe_NICA_uuid=`xe pif-list device=${CFG_INITIALNIC} params=uuid --minimal`;
+	WriteOutput "INFO  ${CFG_INITIALNIC} detected as "${strXe_NICA_uuid};
+
+	# Configure IP address 
+	xe pif-reconfigure-ip uuid=${strXe_NICA_uuid} mode=static IP=${CFG_IP} gateway=${CFG_DG} netmask=${CFG_NETMASK} DNS=${CFG_DNS1},${CFG_DNS2};
+	xe host-management-reconfigure pif-uuid=${strXe_NICA_uuid};
+	WriteOutput "INFO  ${CFG_INITIALNIC} configured as management interface with IP address "${CFG_IP}"/"${CFG_NETMASK};
+}
+
+#################################################################################################################
+# Pool join
+# Checks the specified poolmaster and join if poolmaster build is complete
+#
+function JoinPool()
+{
+	source ${BUILDCONFIGSCRIPT};
+
+	WriteOutput "INFO  ${DELIMITER}";
+	WriteOutput "INFO  Pool join";	
+	
+	local intRetryCounter;
+	local strRemoteHostname;
+	
+	WriteOutput "INFO  Attempting to join poolmaster with IP "${CFG_POOLMASTER};
+	
+	intRetryCounter="0";
+	strRemoteBuildStatus="";
+	while [ ${intRetryCounter} -ne ${POOLJOINRETRIES} ];
+	do
+		# Try to ping poolmaster
+		PingIP ${CFG_POOLMASTER};
+		if [ $? -eq 0 ];
+		then
+			WriteOutput "INFO  Poolmaster "${CFG_POOLMASTER}" is reachable.";
+			strRemoteBuildStatus=`xe host-list address=${CFG_POOLMASTER} params=name-description --minimal -u root -pw ${CFG_POOLMASTERPWD} -s ${CFG_POOLMASTER}`;
+			if [ "${strRemoteBuildStatus}" == "${BUILDVERSION} (BUILD COMPLETE)" ];
+			then
+				# Using host description to check if build is complete
+				WriteOutput "INFO  Poolmaster build complete: " ${strRemoteBuildStatus};
+
+				# Adding delay to prevent slaves joinging pool too quickly after poolmaster is completed
+				sleep 60;
+				xe pool-join master-address=${CFG_POOLMASTER} master-username=root master-password=${CFG_POOLMASTERPWD};
+				if [ $? -eq 0 ];
+                then
+					WriteOutput "INFO  Successfully joined pool.";
+                else
+                   	WriteOutput "ERROR Problems joining pool.";
+                   	UpdateBuildStatus ${BUILDERROR};
+					exit;
+                fi
+                # wait for 30 seconds to allow xapi to complete all joining actions.
+                sleep 30;
+				# on join - successful or not - break out of the while loop
+				break;
+			else	
+				WriteOutput "WARN  Poolmaster build not yet complete, waiting "${POOLJOINRETRYDELAY}" seconds:" ${strRemoteBuildStatus};
+			fi
+		else	
+			WriteOutput "INFO  Can not reach poolmaster "${CFG_POOLMASTER}", waiting "${POOLJOINRETRYDELAY}" seconds.";
+		fi
+
+		# increment retry counter
+		((intRetryCounter++));
+		sleep ${POOLJOINRETRYDELAY};
+	done	
+	
+	#Reached max retries
+	if [ ${intRetryCounter} -eq ${POOLJOINRETRIES} ];
+	then 
+		WriteOutput "ERROR Maximum pool join retries ("${POOLJOINRETRIES}") reached, giving up.";
+		UpdateBuildStatus ${BUILDERROR};
+	fi
+}
+
+#################################################################################################
+# Ping IP address, return 1 for unreachable, 0 for reachable
+function PingIP()
+{
+	if ! ping -c 1 -w 1 "$1" &>/dev/null ; 
+	then
+		# Unreachable
+		return 1;
+	else
+		# Response
+		return 0;
+	fi
+}
+
+#################################################################################################
+# Set Dom0 memory according to config
+#
+function Xen62Dom0Config()
+{
+	source ${BUILDCONFIGSCRIPT};
+	WriteOutput "INFO  ${DELIMITER}";
+	WriteOutput "INFO  Dom0 memory configuration";	
+        
+	local intMemoryLimit;
+
+	if [ "${CFG_DOM0MEM}" ]; then
+
+		# Make sure memory limit is between 400 (Citrix recommended minimum) and 4096
+		# See XS62 admin guide for more details
+		if [ ${CFG_DOM0MEM} -lt 400 ];
+		then 
+			intMemoryLimit="400";
+		elif [ ${CFG_DOM0MEM} -gt 4096 ];
+		then
+			intMemoryLimit="4096";
+		else
+			intMemoryLimit=${CFG_DOM0MEM};
+		fi
+	
+		# Configure new memory limit
+	
+		/opt/xensource/libexec/xen-cmdline --set-xen dom0_mem=${intMemoryLimit}M,max:${intMemoryLimit}M;
+
+    	WriteOutput "INFO  Host DOM0 memory limit set to ${intMemoryLimit}, host rebooting for limit to take effect.";
+
+	else
+		WriteOutput "INFO  No host DOM0 memory limit specified.";
+	fi
+}
+
+function PostBuildHousekeeping()
+{	
+	source ${BUILDCONFIGSCRIPT};
+	WriteOutput "INFO  ${DELIMITER}";
+	WriteOutput "INFO  Housekeeping";	
+	
+	# Switch build service off
+	chkconfig ${BUILDSERVICE} off;
+	WriteOutput "INFO  Build service disabled: "`chkconfig --list ${BUILDSERVICE}`;
+	
+	# Restarting Xapi just to make sure all OK
+	WriteOutput "INFO  Restarting Xapi.";
+	/opt/xensource/bin/xe-toolstack-restart;
+
+	# Sort out splashy back to original Citrix splash screen
+	cd /usr/share/splashy/themes/citrix-theme
+	mv background.png ${SPLASHSCREENFILE};
+	mv ctxbackground.orig background.png;
+	cd ${BUILDFOLDER};
+
+	# Tidy files no longer required
+	if [ "${CFG_SERVERROLE}" = "SLAVE" ];
+	then
+		WriteOutput "INFO  Removing patch files not required.";
+		rm -f ${PATCHFOLDER}/${PATCHFILE};	
+	fi
+
+	WriteOutput "INFO  BUILD IS NOW COMPLETE.";
+}
+
+
+#################################################################################################################################
+# MAIN SCRIPT EXECUTION
+
+case "$1" in
+	start)
+	#############################################################################################
+	#
+	# Install execution: upon completion every step update the status file to the 
+	# next build step. This keeps the build steps persistent across reboots - i.e. 
+	# make sure next build step is updated BEFORE reboot, otherwise the server will continue rebooting.
+	# For fatal errors the build status will be updated to ${BUILDERROR}, the CheckBuildStatus function 
+	# will check for this and stop all script execution. Normal script execution completion is 
+	# indicated with a build status of ${BUILDCOMPLETION}, at which point this build service will be disabled.
+	#
+	# 
+	if [ ! -f ${BUILDSTATUSFILE} ];
+	then
+		echo -e "CURRENTSTEP:1" > $BUILDSTATUSFILE;
+	fi	
+	CheckBuildStatus;
+	while [ ${intCurrentBuildStep} -ne ${BUILDCOMPLETION} ];
+	do
+		case "$intCurrentBuildStep" in
+		1) #Prep, download files etc.
+			CheckRelease;
+			CheckHardware;
+			ReportKernel;
+			# DownloadAllFiles;
+			ChangeRootPwd;
+			ConfigureNTP;
+			InstallLicense;
+			UpdateBuildStatus 2;
+			;;
+			
+		2) #Configure basic networking
+			ConfigureBasicNetworking;
+			UpdateBuildStatus 3;
+			;;
+			
+		3) #Patch all servers from file and reboot. Now done before pool join to avoid join errors.
+			InstallXSPatches;
+			UpdateBuildStatus 4;
+			RebootServer;
+			exit;
+			;;	
+	
+		4) 	#Configure networks and bonds on poolmaster.
+			#Networks and bonds are auto created when slave join pool hence these are double checked only.
+			source ${BUILDCONFIGSCRIPT};
+			case "${CFG_SERVERROLE}" in
+			POOLMASTER)
+				WriteOutput "INFO  Configuring poolmaster networking.";
+				ConfigureEthIP;
+				ConfigurePoolmasterNetworks;
+				;;
+
+			SLAVE)
+				WriteOutput "INFO  Configuring slave networking.";
+				ConfigureEthIP;
+				JoinPool;	
+				# Sleep to allow host to catch up with poolmaster
+				sleep 60;
+				ConfigureSlaveNetworks;
+				;;
+
+			*)
+				WriteOutput "ERROR No pool role detected, exiting.";
+				UpdateBuildStatus ${BUILDERROR};
+				exit;
+				;;
+			esac #server role
+			UpdateBuildStatus 5;
+			;;
+
+		5) # Dom0 mem config
+			Xen62Dom0Config;	
+			UpdateBuildStatus 6;
+			RebootServer;
+			exit;
+			;;
+
+		6) #Host has been rebooted, patch drivers (which rely on patches being installed)
+			#WriteOutput "INFO  Server back up after reboot ("`uptime | cut -d"," -f1 | cut -d" " -f3,4,5`")";
+			UpdateDrivers;
+			UpdateBuildStatus 7;
+			RebootServer;
+			exit;
+			;;
+
+		7) #Tidy for now.
+			WriteOutput "INFO  Server back up after reboot ("`uptime | cut -d"," -f1 | cut -d" " -f3,4,5`")";
+			PostBuildHousekeeping;
+			UpdateBuildStatus ${BUILDCOMPLETION};
+			;;
+
+		esac
+	
+	# Check current build status before next iteration.
+	CheckBuildStatus;
+
+	done #Loop for progressing through build 
+	;;
+
+	stop)
+	;;
+	
+  	status)
+	;;
+  	
+  	*)
+		echo $"Usage: start|status}"
+	;;
+esac
+
+exit

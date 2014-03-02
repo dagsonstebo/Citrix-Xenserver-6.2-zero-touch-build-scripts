@@ -1,0 +1,10 @@
+Citrix Xenserver 6.2 automated build scripts.
+
+/xs62-ks/template.cfg		Template host specific configuration file. 
+/xs62-ks/xs62cn1.cfg		Example host config file.
+/xs62-ks/xs62cn1.xml		Example host kickstart file.
+/xs62-scripts/xs62ps.sh 	Post build script. Prepopulates build script, drivers, patches and splash screen.
+/xs62-scripts/xs62buildsvc	Main build script.
+/xs62-scripts/xsbuildbackground.png Build splash screen.
+/pxelinux.cfg/default		Default pxelinux.cfg menu file pointing to vsphere menu file. Refer to pxelinux PXE configuration.
+/pxelinux.cfg/xenserver		Xenserver PXE menu config, referred to from default pxelinux file above.

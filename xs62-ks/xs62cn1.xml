@@ -1,0 +1,11 @@
+<?xml version="1.0"?>
+<installation srtype="ext">
+	<primary-disk>sda</primary-disk>
+	<keymap>uk</keymap>
+	<root-password>Password21</root-password>
+	<source type="url">http://192.168.0.100/xs62-install/</source>
+	<script stage="filesystem-populated" type="url">http://192.168.0.100/xs62-scripts/xs62ps.sh</script>
+	<admin-interface name="eth0" proto="dhcp" />
+	<timezone>Etc/UTC</timezone>
+	<hostname>xs62cn1.mylab.local</hostname>
+</installation>
